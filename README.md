@@ -4,7 +4,7 @@ A powerful and user-friendly extension for ComfyUI that adds a built-in model do
 
 ## Features
 
-- 🚀 **High-Speed Downloads**: Optimized for datacenter connections with parallel downloading (8 connections, 32MB chunks)
+- 🚀 **High-Speed Downloads**: Uses `wget` on the ComfyUI server for robust large-file downloads
 - 📦 **Queue Management**: Download multiple files with automatic queue processing
 - 🎯 **Smart Integration**: Detects missing models from your workflow and suggests downloads
 - 🔄 **Real-time Progress**: Live progress tracking with download speed and ETA
@@ -46,7 +46,7 @@ Models urls are loaded from workflow or https://github.com/Comfy-Org/ComfyUI-Man
 - ComfyUI
 - Dependencies:
   - `aiohttp`
-  - `hf_transfer`
+  - `wget` available in server `PATH`
 
 ## Usage
 
@@ -82,11 +82,7 @@ sdxl/checkpoints/my-model.safetensors
 
 ## Configuration
 
-The extension uses optimized settings for datacenter connections:
-- **Chunk Size**: 32MB (balanced for 500MB to 30GB+ files)
-- **Parallel Connections**: 8 (optimal for datacenter bandwidth)
-
-These settings are configured in the `__init__.py` file and can be adjusted if needed.
+The extension shells out to `wget` for the actual file transfer and polls the output file to report progress back to the UI.
 
 ## Supported Folders
 
@@ -171,8 +167,8 @@ ComfyUI-Downloader/
 - Ensure you have write permissions to the ComfyUI directories
 
 ### Slow Download Speeds
-- The extension is optimized for datacenter connections
-- Adjust `CHUNK_SIZE` and `NUM_CONNECTIONS` in `__init__.py` if needed
+- Download performance depends on the remote host and your server network path
+- Check that `wget` is installed and accessible from the ComfyUI process
 - Check your network bandwidth and latency
 
 ## Contributing

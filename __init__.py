@@ -6,6 +6,9 @@ Adds a Downloader button to ComfyUI interface with modal UI
 import os
 import logging
 import asyncio
+import contextlib
+import shutil
+import urllib.request
 import folder_paths
 from aiohttp import web
 from server import PromptServer
@@ -18,9 +21,8 @@ download_control = {}
 download_queue = []
 current_download_task = None  # Only one download at a time
 
-# Configuration optimized for datacenter connections
-CHUNK_SIZE = 32 * 1024 * 1024  # 32MB chunks - balanced for 500MB to 30GB+ files
-NUM_CONNECTIONS = 8  # 8 parallel connections - optimal for DC bandwidth
+# Polling interval for wget-backed progress updates
+PROGRESS_UPDATE_INTERVAL = 0.25
 
 API_PREFIX = "35b631e00fa2dbc173ee4a5f899cba8f"
 
@@ -205,7 +207,7 @@ async def process_download_queue():
     active_downloads[download_id]["progress"] = 0
     active_downloads[download_id]["downloaded"] = 0
 
-    logging.info(f"[ComfyUI-Downloader] Starting download {download_id} with {NUM_CONNECTIONS} connections")
+    logging.info(f"[ComfyUI-Downloader] Starting wget download {download_id}")
 
     # Notify frontend that download is starting
     await PromptServer.instance.send("server_download_progress", {
@@ -233,264 +235,142 @@ def on_download_complete(download_id):
     asyncio.create_task(process_download_queue())
 
 
-async def download_chunk(session, url, start, end, output_path, chunk_index, download_id):
-    """Download a specific chunk of the file"""
-    headers = {'Range': f'bytes={start}-{end}'}
+async def get_remote_file_size(url):
+    """Best-effort remote file size lookup for progress percentages."""
+    request = urllib.request.Request(url, method="HEAD")
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return int(response.headers.get("Content-Length", 0))
 
-    try:
-        async with session.get(url, headers=headers) as response:
-            if response.status not in [200, 206]:
-                return None
 
-            chunk_data = await response.read()
+async def report_wget_progress(download_id):
+    """Poll the target file size while wget writes to disk."""
+    download_state = active_downloads.get(download_id)
+    if download_state is None:
+        return
 
-            # Write chunk to file at specific position
-            with open(output_path, 'r+b') as f:
-                f.seek(start)
-                f.write(chunk_data)
+    output_path = download_state["output_path"]
+    total_size = download_state.get("total", 0)
 
-            return len(chunk_data)
-    except Exception as e:
-        logging.error(f"[ComfyUI-Downloader] Error downloading chunk {chunk_index} for {download_id}: {e}")
-        return None
+    while True:
+        control = download_control.get(download_id)
+        if control is None:
+            return
+
+        process = control.get("process")
+        if process is not None and process.returncode is not None:
+            break
+
+        if download_id not in active_downloads:
+            return
+
+        downloaded_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        active_downloads[download_id]["downloaded"] = downloaded_size
+
+        progress = 0
+        if total_size > 0:
+            progress = round(min(downloaded_size / total_size, 1) * 100, 2)
+            active_downloads[download_id]["progress"] = progress
+
+        await PromptServer.instance.send("server_download_progress", {
+            "download_id": download_id,
+            "progress": progress,
+            "downloaded": downloaded_size,
+            "total": total_size
+        })
+
+        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
 
 
 async def download_file(url, output_path, download_id):
-    """Download file with multi-connection support and progress tracking"""
-    import aiohttp
+    """Download file with wget and poll the output file for progress."""
+    wget_path = shutil.which("wget")
+    if wget_path is None:
+        raise RuntimeError("wget not found in PATH")
 
-    logging.info(f"[ComfyUI-Downloader] Download {download_id} using {NUM_CONNECTIONS} connections")
+    logging.info(f"[ComfyUI-Downloader] Download {download_id} using wget")
+
+    progress_task = None
 
     try:
-        # Initialize control for this download
-        import time
+        total_size = 0
+        try:
+            total_size = await get_remote_file_size(url)
+        except Exception as e:
+            logging.warning(f"[ComfyUI-Downloader] Could not determine file size for {download_id}: {e}")
+
+        if download_id not in active_downloads:
+            return
+
+        active_downloads[download_id]["total"] = total_size
+        active_downloads[download_id]["downloaded"] = 0
+
         download_control[download_id] = {
-            "paused": False,
             "cancelled": False,
-            "total_downloaded": 0,
-            "last_progress_time": time.time(),
-            "last_report_time": 0,  # Shared timestamp for throttling progress updates
-            "lock": asyncio.Lock()
+            "process": None,
         }
 
-        timeout = aiohttp.ClientTimeout(total=None)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Get file size - try HEAD first, then fall back to GET with Range
-            total_size = 0
-            supports_range = False
+        # Always start from a clean target file instead of resuming partial content.
+        if os.path.exists(output_path):
+            os.remove(output_path)
 
-            try:
-                # Try HEAD request first
-                async with session.head(url, allow_redirects=True) as response:
-                    if response.status == 200:
-                        total_size = int(response.headers.get('content-length', 0))
-                        supports_range = response.headers.get('accept-ranges') == 'bytes'
-            except Exception as e:
-                logging.warning(f"[ComfyUI-Downloader] HEAD request failed for {download_id}: {e}")
+        process = await asyncio.create_subprocess_exec(
+            wget_path,
+            "--output-document",
+            output_path,
+            url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        download_control[download_id]["process"] = process
 
-            # If HEAD didn't give us the size, try GET with Range header
-            if total_size == 0:
-                logging.info(f"[ComfyUI-Downloader] HEAD request didn't return size, trying GET with Range for {download_id}")
-                try:
-                    headers = {'Range': 'bytes=0-0'}
-                    async with session.get(url, headers=headers, allow_redirects=True) as response:
-                        if response.status in [200, 206]:
-                            # Try to get size from Content-Range header first
-                            content_range = response.headers.get('content-range', '')
-                            if content_range:
-                                parts = content_range.split('/')
-                                if len(parts) == 2:
-                                    total_size = int(parts[1])
-                                    supports_range = True
+        progress_task = asyncio.create_task(report_wget_progress(download_id))
+        stdout, stderr = await process.communicate()
 
-                            # Fallback to Content-Length
-                            if total_size == 0:
-                                total_size = int(response.headers.get('content-length', 0))
-                except Exception as e:
-                    logging.warning(f"[ComfyUI-Downloader] GET with Range failed for {download_id}: {e}")
+        if progress_task is not None:
+            await progress_task
 
-            if total_size == 0:
-                raise Exception("Could not determine file size from server")
-
-            logging.info(f"[ComfyUI-Downloader] File size for {download_id}: {total_size} bytes, supports range: {supports_range}")
-
-            # Create file with full size
-            with open(output_path, 'wb') as f:
-                f.seek(total_size - 1)
-                f.write(b'\0')
-
-            active_downloads[download_id]["total"] = total_size
-            active_downloads[download_id]["downloaded"] = 0
-
-            # Use multi-connection download if server supports range requests
-            if supports_range and total_size > CHUNK_SIZE:
-                logging.info(f"[ComfyUI-Downloader] Using {NUM_CONNECTIONS} connections for {download_id}")
-
-                # Calculate chunk ranges
-                chunk_size = total_size // NUM_CONNECTIONS
-                tasks = []
-
-                for i in range(NUM_CONNECTIONS):
-                    start = i * chunk_size
-                    end = start + chunk_size - 1 if i < NUM_CONNECTIONS - 1 else total_size - 1
-
-                    tasks.append(download_chunk_with_progress(
-                        session, url, start, end, output_path, i, download_id, total_size
-                    ))
-
-                # Download all chunks in parallel
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # Check for errors
-                for result in results:
-                    if isinstance(result, Exception):
-                        raise result
-
-            else:
-                # Fallback to single connection download
-                logging.info(f"[ComfyUI-Downloader] Using single connection for {download_id}")
-                await download_single_connection(session, url, output_path, download_id, total_size)
-
-            # Check if cancelled
-            if download_control[download_id]["cancelled"]:
+        if download_control.get(download_id, {}).get("cancelled"):
+            if os.path.exists(output_path):
                 os.remove(output_path)
-                return
+            return
 
-            # Mark as complete
+        if process.returncode != 0:
+            error_output = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(error_output or f"wget exited with code {process.returncode}")
+
+        final_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        if download_id in active_downloads:
+            active_downloads[download_id]["downloaded"] = final_size
+            active_downloads[download_id]["total"] = max(total_size, final_size)
             active_downloads[download_id]["status"] = "completed"
             active_downloads[download_id]["progress"] = 100
 
-            # Send completion message
-            await PromptServer.instance.send("server_download_complete", {
-                "download_id": download_id,
-                "path": output_path,
-                "size": total_size
-            })
+        await PromptServer.instance.send("server_download_complete", {
+            "download_id": download_id,
+            "path": output_path,
+            "size": final_size
+        })
 
-            logging.info(f"[ComfyUI-Downloader] Successfully downloaded {download_id} to {output_path}")
-
-            # Cleanup
-            del download_control[download_id]
+        logging.info(f"[ComfyUI-Downloader] Successfully downloaded {download_id} to {output_path}")
 
     except Exception as e:
         logging.error(f"[ComfyUI-Downloader] Error downloading {download_id}: {e}")
-        active_downloads[download_id]["status"] = "error"
-        active_downloads[download_id]["error"] = str(e)
+        if download_id in active_downloads:
+            active_downloads[download_id]["status"] = "error"
+            active_downloads[download_id]["error"] = str(e)
 
         await PromptServer.instance.send("server_download_error", {
             "download_id": download_id,
             "error": str(e)
         })
+    finally:
+        if progress_task is not None and not progress_task.done():
+            progress_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress_task
 
-        # Cleanup
         if download_id in download_control:
             del download_control[download_id]
-
-
-async def download_chunk_with_progress(session, url, start, end, output_path, chunk_index, download_id, total_size):
-    """Download chunk with progress tracking"""
-    headers = {'Range': f'bytes={start}-{end}'}
-    chunk_size = end - start + 1
-    downloaded = 0
-    last_report_time = 0
-
-    try:
-        async with session.get(url, headers=headers) as response:
-            if response.status not in [200, 206]:
-                raise Exception(f"HTTP {response.status} for chunk {chunk_index}")
-
-            with open(output_path, 'r+b') as f:
-                f.seek(start)
-
-                async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                    # Check if paused
-                    while download_control.get(download_id, {}).get("paused", False):
-                        await asyncio.sleep(0.5)
-
-                    # Check if cancelled
-                    if download_control.get(download_id, {}).get("cancelled", False):
-                        return
-
-                    # Check for stalled download (no progress for 10 seconds)
-                    import time
-                    current_time = time.time()
-                    if current_time - download_control[download_id]["last_progress_time"] > 10:
-                        logging.error(f"[ComfyUI-Downloader] Download stalled for {download_id} - no progress for 10 seconds")
-                        download_control[download_id]["cancelled"] = True
-                        raise Exception("Download stalled - no progress for 10 seconds")
-
-                    f.write(chunk)
-                    chunk_len = len(chunk)
-                    downloaded += chunk_len
-
-                    # Update shared progress counter with lock
-                    async with download_control[download_id]["lock"]:
-                        download_control[download_id]["total_downloaded"] += chunk_len
-                        download_control[download_id]["last_progress_time"] = time.time()
-                        total_downloaded = download_control[download_id]["total_downloaded"]
-                        
-                        # Send progress updates every 100ms to avoid spam (shared across all chunks)
-                        current_time = time.time()
-                        if (current_time - download_control[download_id]["last_report_time"]) >= 0.1:
-                            download_control[download_id]["last_report_time"] = current_time
-                            
-                            progress = round((total_downloaded / total_size) * 100, 2)
-                            active_downloads[download_id]["progress"] = progress
-                            active_downloads[download_id]["downloaded"] = total_downloaded
-
-                            await PromptServer.instance.send("server_download_progress", {
-                                "download_id": download_id,
-                                "progress": progress,
-                                "downloaded": total_downloaded,
-                                "total": total_size
-                            })
-
-    except Exception as e:
-        logging.error(f"[ComfyUI-Downloader] Error in chunk {chunk_index} for {download_id}: {e}")
-        raise
-
-
-async def download_single_connection(session, url, output_path, download_id, total_size):
-    """Fallback single connection download"""
-    downloaded_size = 0
-
-    async with session.get(url) as response:
-        if response.status != 200:
-            raise Exception(f"HTTP {response.status}")
-
-        with open(output_path, 'wb') as f:
-            async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                # Check if paused
-                while download_control.get(download_id, {}).get("paused", False):
-                    await asyncio.sleep(0.5)
-
-                # Check if cancelled
-                if download_control.get(download_id, {}).get("cancelled", False):
-                    return
-
-                # Check for stalled download (no progress for 10 seconds)
-                import time
-                current_time = time.time()
-                if current_time - download_control[download_id]["last_progress_time"] > 10:
-                    logging.error(f"[ComfyUI-Downloader] Download stalled for {download_id} - no progress for 10 seconds")
-                    download_control[download_id]["cancelled"] = True
-                    raise Exception("Download stalled - no progress for 10 seconds")
-
-                f.write(chunk)
-                downloaded_size += len(chunk)
-                download_control[download_id]["last_progress_time"] = time.time()
-
-                # Update progress
-                progress = round((downloaded_size / total_size) * 100, 2)
-                active_downloads[download_id]["progress"] = progress
-                active_downloads[download_id]["downloaded"] = downloaded_size
-
-                await PromptServer.instance.send("server_download_progress", {
-                    "download_id": download_id,
-                    "progress": progress,
-                    "downloaded": downloaded_size,
-                    "total": total_size
-                })
 
 
 @PromptServer.instance.routes.get(f"/{API_PREFIX}/server_download/status")
@@ -535,11 +415,16 @@ async def cancel_download(request):
         # Check if download is active
         if download_id in download_control:
             download_control[download_id]["cancelled"] = True
-            # Give it a moment to detect cancellation and cleanup
-            await asyncio.sleep(0.1)
+            if download_id in active_downloads:
+                active_downloads[download_id]["status"] = "cancelled"
+            process = download_control[download_id].get("process")
+            if process is not None and process.returncode is None:
+                process.terminate()
+                with contextlib.suppress(ProcessLookupError, asyncio.TimeoutError):
+                    await asyncio.wait_for(process.wait(), timeout=2)
 
         # Remove from active downloads
-        if download_id in active_downloads:
+        if was_queued and download_id in active_downloads:
             del active_downloads[download_id]
 
         # Cleanup control if still present
