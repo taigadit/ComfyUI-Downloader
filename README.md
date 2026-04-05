@@ -91,7 +91,7 @@ sdxl/checkpoints/my-model.safetensors
 - The **Download Missing** button queues every missing model that already has a URL and folder configured
 - If any missing model does not have a URL or folder, the batch action stops immediately and shows which entries need to be fixed first
 
-Example of the batch download controls in the top-right action bar:
+Example of the batch download controls in the top-right action bar, with the **Download Missing** button highlighted:
 
 ![Download Missing action bar](assets/download-missing-workflow-models.png)
 
