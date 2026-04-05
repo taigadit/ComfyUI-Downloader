@@ -7,6 +7,7 @@ A powerful and user-friendly extension for ComfyUI that adds a built-in model do
 - 🚀 **High-Speed Downloads**: Uses `wget` on the ComfyUI server for robust large-file downloads
 - 📦 **Queue Management**: Download multiple files with automatic queue processing
 - 🎯 **Smart Integration**: Detects missing models from your workflow and suggests downloads
+- ⚡ **One-Click Missing Downloads**: Queue every missing workflow model from the top-right action bar
 - 🔄 **Real-time Progress**: Live progress tracking with download speed and ETA
 - 🛡️ **Security**: Built-in path traversal protection and file validation
 - 📂 **Auto-Organization**: Downloads files to the correct ComfyUI folders (checkpoints, loras, VAEs, etc.)
@@ -53,10 +54,12 @@ Models urls are loaded from workflow or https://github.com/Comfy-Org/ComfyUI-Man
 ### Basic Usage
 1. Click the **"Downloader"** button in the ComfyUI interface (next to the settings button)
 2. The downloader modal will open
-3. Paste a model URL in the URL field
-4. Select the destination folder (checkpoints, loras, vae, etc.)
-5. Enter a filename (supports subfolders like `subfolder/model.safetensors`)
-6. Click **"Download"**
+3. Use **Refresh Models** to scan the current workflow for referenced models
+4. To download everything missing at once, click **Download Missing** in the top-right action bar
+5. Or paste a model URL in the manual download section for a single file
+6. Select the destination folder (checkpoints, loras, vae, etc.)
+7. Enter a filename (supports subfolders like `subfolder/model.safetensors`)
+8. Click **Download**
 
 ### Advanced Features
 
@@ -74,11 +77,14 @@ sdxl/checkpoints/my-model.safetensors
 #### Missing Model Detection
 - The extension scans your workflow for missing models
 - Missing models are highlighted in the UI for quick downloading
+- The **Download Missing** button queues every missing model that already has a URL and folder configured
+- If any missing model does not have a URL or folder, the batch action stops immediately and shows which entries need to be fixed first
 
 #### Queue Management
 - Multiple downloads are queued automatically
 - One download processes at a time for optimal performance
 - Cancel queued or active downloads anytime
+- Batch downloads reuse the same queue, so one-click actions stay in order with manual downloads
 
 ## Configuration
 
@@ -165,6 +171,7 @@ ComfyUI-Downloader/
 - Verify the URL is accessible
 - Check browser console and ComfyUI terminal for error messages
 - Ensure you have write permissions to the ComfyUI directories
+- If **Download Missing** stops immediately, fill in the missing URL or folder shown in the alert and try again
 
 ### Slow Download Speeds
 - Download performance depends on the remote host and your server network path
