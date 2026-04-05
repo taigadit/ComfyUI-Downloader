@@ -8,7 +8,7 @@ A powerful and user-friendly extension for ComfyUI that adds a built-in model do
 - 📦 **Queue Management**: Download multiple files with automatic queue processing
 - 🎯 **Smart Integration**: Detects missing models from your workflow and suggests downloads
 - ⚡ **One-Click Missing Downloads**: Queue every missing workflow model from the top-right action bar
-- 🔄 **Real-time Progress**: Live progress tracking with download speed and ETA
+- 🔄 **Real-time Progress**: Live progress tracking for queued and active downloads
 - 🛡️ **Security**: Built-in path traversal protection and file validation
 - 📂 **Auto-Organization**: Downloads files to the correct ComfyUI folders (checkpoints, loras, VAEs, etc.)
 - ⏸️ **Download Control**: Cancel downloads in progress with queue management
@@ -30,23 +30,34 @@ Models urls are loaded from workflow or https://github.com/Comfy-Org/ComfyUI-Man
 
 2. Clone this repository:
    ```bash
-   git clone https://github.com/romandev-codex/ComfyUI-Downloader.git
+   git clone https://github.com/taigadit/ComfyUI-Downloader.git
    ```
 
-3. Install dependencies:
+3. Install Python dependencies:
    ```bash
    cd ComfyUI-Downloader
    pip install -r requirements.txt
    ```
 
-4. Restart ComfyUI
+4. Install `wget` if your system does not already provide it:
+   ```bash
+   # macOS (Homebrew)
+   brew install wget
+
+   # Ubuntu / Debian
+   sudo apt-get install wget
+   ```
+
+5. Restart ComfyUI
 
 ## Requirements
 
 - Python 3.8+
 - ComfyUI
 - Dependencies:
+- Python package:
   - `aiohttp`
+- System dependency:
   - `wget` available in server `PATH`
 
 ## Usage
@@ -147,6 +158,7 @@ POST /{API_PREFIX}/server_download/cancel
 ### Project Structure
 ```
 ComfyUI-Downloader/
+├── assets/                # README screenshots
 ├── __init__.py              # Main extension logic and API endpoints
 ├── requirements.txt         # Python dependencies
 ├── web/
