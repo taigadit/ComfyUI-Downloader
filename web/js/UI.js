@@ -13,6 +13,10 @@ export class DownloaderUI {
         this.objectInfoCache = null; // Cache for object_info
         this.availableFilesCache = null; // Cache for parsed available files
         this.downloadStates = new Map(); // Track download states
+        this.downloadAvailability = new Map(); // Track whether a model exists locally
+        this.modelDownloadIds = new Map(); // Track model -> active download id
+        this.downloadIdToModelKey = new Map(); // Track download id -> model
+        this.isBatchQueueing = false;
         this.setupDownloadListeners();
     }
 
@@ -29,6 +33,7 @@ export class DownloaderUI {
                 total
             });
             this.updateDownloadButton(download_id);
+            this.updateBatchDownloadButton();
         });
 
         api.addEventListener("server_download_complete", ({ detail }) => {
@@ -38,7 +43,12 @@ export class DownloaderUI {
                 progress: 100,
                 path
             });
+            const modelKey = this.downloadIdToModelKey.get(download_id);
+            if (modelKey) {
+                this.downloadAvailability.set(modelKey, true);
+            }
             this.updateDownloadButton(download_id);
+            this.updateBatchDownloadButton();
             console.log(`[DownloaderUI] Download completed: ${download_id}`);
         });
 
@@ -49,8 +59,136 @@ export class DownloaderUI {
                 error
             });
             this.updateDownloadButton(download_id);
+            this.updateBatchDownloadButton();
             console.error(`[DownloaderUI] Download error: ${download_id} - ${error}`);
         });
+    }
+
+    getModelKey(model) {
+        return model.filenamePath || model.filename || '';
+    }
+
+    getDownloadStateForModel(model) {
+        const downloadId = this.modelDownloadIds.get(this.getModelKey(model));
+        if (!downloadId) {
+            return null;
+        }
+        return this.downloadStates.get(downloadId) || null;
+    }
+
+    getModelConfigForIndex(modelIndex) {
+        const model = this.modelsInWorkflow[modelIndex];
+        if (!model) {
+            return null;
+        }
+
+        const directoryInput = this.modal?.querySelector(`.downloader-directory-input[data-model-index="${modelIndex}"]`);
+        const urlInput = this.modal?.querySelector(`.downloader-url-input[data-model-index="${modelIndex}"]`);
+
+        return {
+            ...model,
+            directory: directoryInput?.value.trim() || model.directory || '',
+            url: urlInput?.value.trim() || model.url || '',
+        };
+    }
+
+    updateBatchDownloadButton() {
+        if (!this.modal) return;
+
+        const batchButton = this.modal.querySelector("#downloader-download-missing-btn");
+        if (!batchButton) return;
+
+        if (this.isBatchQueueing) {
+            batchButton.textContent = "Queueing...";
+            batchButton.disabled = true;
+            return;
+        }
+
+        const pendingMissing = this.modelsInWorkflow.filter((model) => {
+            const modelKey = this.getModelKey(model);
+            if (this.downloadAvailability.get(modelKey)) {
+                return false;
+            }
+
+            const state = this.getDownloadStateForModel(model);
+            if (!state) {
+                return true;
+            }
+
+            return !['queued', 'downloading', 'completed'].includes(state.status);
+        });
+
+        batchButton.textContent = `Download Missing (${pendingMissing.length})`;
+        batchButton.disabled = pendingMissing.length === 0;
+    }
+
+    async queueMissingModels() {
+        const missingModels = this.modelsInWorkflow
+            .map((_, index) => ({
+                modelIndex: index,
+                model: this.getModelConfigForIndex(index),
+            }))
+            .filter(({ model }) => model)
+            .filter(({ model }) => {
+            const modelKey = this.getModelKey(model);
+            if (this.downloadAvailability.get(modelKey)) {
+                return false;
+            }
+
+            const state = this.getDownloadStateForModel(model);
+            return !state || !['queued', 'downloading', 'completed'].includes(state.status);
+            });
+
+        if (missingModels.length === 0) {
+            this.updateBatchDownloadButton();
+            return;
+        }
+
+        const invalidModels = missingModels
+            .map(({ model }) => {
+                const issues = [];
+                if (!model.url) issues.push("missing URL");
+                if (!model.directory) issues.push("missing folder");
+                if (issues.length === 0) return null;
+                return `${model.filename}: ${issues.join(", ")}`;
+            })
+            .filter(Boolean);
+
+        if (invalidModels.length > 0) {
+            alert(
+                `Batch download aborted. Fix these models first:\n\n${invalidModels.join("\n")}`
+            );
+            return;
+        }
+
+        this.isBatchQueueing = true;
+        this.updateBatchDownloadButton();
+
+        try {
+            for (const { model, modelIndex } of missingModels) {
+                const result = await this.startServerDownload(model.url, model.directory, model.filenamePath);
+                if (!result || !result.success || !result.download_id) {
+                    throw new Error(result?.error || `Failed to queue ${model.filename}`);
+                }
+
+                const modelKey = this.getModelKey(model);
+                this.modelDownloadIds.set(modelKey, result.download_id);
+                this.downloadIdToModelKey.set(result.download_id, modelKey);
+
+                const button = this.modal?.querySelector(
+                    `.downloader-download-btn[data-model-index="${modelIndex}"]`
+                );
+                if (button) {
+                    button.dataset.downloadId = result.download_id;
+                    this.updateDownloadButton(result.download_id);
+                }
+            }
+        } catch (error) {
+            alert(`Batch download aborted: ${error.message}`);
+        } finally {
+            this.isBatchQueueing = false;
+            this.updateBatchDownloadButton();
+        }
     }
 
     /**
@@ -90,6 +228,8 @@ export class DownloaderUI {
                 button.dataset.action = 'download';
                 break;
         }
+
+        this.updateBatchDownloadButton();
     }
 
     /**
@@ -111,6 +251,11 @@ export class DownloaderUI {
 
             if (response.ok && result.success) {
                 console.log(`[DownloaderUI] Download cancelled: ${downloadId}`);
+                const modelKey = this.downloadIdToModelKey.get(downloadId);
+                if (modelKey) {
+                    this.modelDownloadIds.delete(modelKey);
+                    this.downloadIdToModelKey.delete(downloadId);
+                }
                 // Reset button state
                 this.downloadStates.delete(downloadId);
                 const button = this.modal.querySelector(`[data-download-id="${downloadId}"]`);
@@ -120,6 +265,7 @@ export class DownloaderUI {
                     button.style.backgroundColor = '#4CAF50';
                     button.dataset.action = 'download';
                 }
+                this.updateBatchDownloadButton();
                 return { success: true };
             } else {
                 alert(`Failed to cancel download: ${result.error || 'Unknown error'}`);
@@ -444,10 +590,15 @@ export class DownloaderUI {
                         </div>
                     </div>
                     <div class="downloader-refresh-section">
-                        <button class="downloader-refresh-btn" id="downloader-refresh-btn">
-                            Refresh Models
-                        </button>
                         <span class="downloader-model-count" id="downloader-model-count">0 models found</span>
+                        <div class="downloader-refresh-actions">
+                            <button class="downloader-refresh-btn" id="downloader-download-missing-btn">
+                                Download Missing (0)
+                            </button>
+                            <button class="downloader-refresh-btn" id="downloader-refresh-btn">
+                                Refresh Models
+                            </button>
+                        </div>
                     </div>
                     <div class="downloader-models-list" id="downloader-models-list">
                         <p class="downloader-loading">Click "Refresh Models" to scan the current workflow...</p>
@@ -464,6 +615,10 @@ export class DownloaderUI {
         // Refresh button handler
         modal.querySelector("#downloader-refresh-btn").addEventListener("click", () => {
             this.scanWorkflowForModels();
+        });
+
+        modal.querySelector("#downloader-download-missing-btn").addEventListener("click", async () => {
+            await this.queueMissingModels();
         });
 
         // Auto-extract filename from URL
@@ -561,6 +716,9 @@ export class DownloaderUI {
                 const modelButtons = modal.querySelectorAll('.downloader-download-btn');
                 if (modelButtons.length > 0) {
                     modelButtons[0].dataset.downloadId = result.download_id;
+                    const modelKey = this.getModelKey(newModel);
+                    this.modelDownloadIds.set(modelKey, result.download_id);
+                    this.downloadIdToModelKey.set(result.download_id, modelKey);
                     // Update button appearance
                     this.updateDownloadButton(result.download_id);
                 }
@@ -765,6 +923,14 @@ export class DownloaderUI {
 
         // Load folder names for dropdown
         const folderNames = await this.loadFolderNames();
+        const availabilityResults = await Promise.all(
+            models.map((model) => this.isFileDownloaded(model.directory || '', model.filenamePath))
+        );
+
+        this.downloadAvailability.clear();
+        models.forEach((model, index) => {
+            this.downloadAvailability.set(this.getModelKey(model), availabilityResults[index]);
+        });
 
         // Create model list
         const modelList = document.createElement('div');
@@ -837,13 +1003,20 @@ export class DownloaderUI {
         downloadButtons.forEach(async (button) => {
             const modelIndex = parseInt(button.dataset.modelIndex);
             const model = this.modelsInWorkflow[modelIndex];
+            const modelKey = this.getModelKey(model);
             
             // Check if file already exists in ComfyUI
-            const fileExists = await this.isFileDownloaded(model.directory || '', model.filenamePath);
+            const fileExists = this.downloadAvailability.get(modelKey);
             if (fileExists) {
                 button.textContent = '✓ Downloaded';
                 button.style.backgroundColor = '#4CAF50';
                 button.disabled = false;
+            } else {
+                const existingDownloadId = this.modelDownloadIds.get(modelKey);
+                if (existingDownloadId) {
+                    button.dataset.downloadId = existingDownloadId;
+                    this.updateDownloadButton(existingDownloadId);
+                }
             }
             
             button.addEventListener('click', async (e) => {
@@ -858,11 +1031,9 @@ export class DownloaderUI {
                 
                 // Handle download action
                 // Get current values from inputs
-                const directoryInput = listContainer.querySelector(`.downloader-directory-input[data-model-index="${modelIndex}"]`);
-                const urlInput = listContainer.querySelector(`.downloader-url-input[data-model-index="${modelIndex}"]`);
-                
-                const directory = directoryInput?.value.trim();
-                const url = urlInput?.value.trim();
+                const currentModel = this.getModelConfigForIndex(modelIndex);
+                const directory = currentModel?.directory;
+                const url = currentModel?.url;
                 
                 if (!url) {
                     alert('Please enter a download URL');
@@ -879,12 +1050,42 @@ export class DownloaderUI {
                 
                 // Update button's download_id with the one returned from backend
                 if (result && result.success && result.download_id) {
+                    this.modelDownloadIds.set(modelKey, result.download_id);
+                    this.downloadIdToModelKey.set(result.download_id, modelKey);
                     button.dataset.downloadId = result.download_id;
                     // Now update the button appearance with the stored state
                     this.updateDownloadButton(result.download_id);
                 }
             });
         });
+
+        const directoryInputs = listContainer.querySelectorAll('.downloader-directory-input');
+        directoryInputs.forEach((input) => {
+            input.addEventListener('change', async () => {
+                const modelIndex = parseInt(input.dataset.modelIndex);
+                const model = this.modelsInWorkflow[modelIndex];
+                if (model) {
+                    model.directory = input.value.trim();
+                    const isDownloaded = await this.isFileDownloaded(model.directory || '', model.filenamePath);
+                    this.downloadAvailability.set(this.getModelKey(model), isDownloaded);
+                }
+                this.updateBatchDownloadButton();
+            });
+        });
+
+        const urlInputs = listContainer.querySelectorAll('.downloader-url-input');
+        urlInputs.forEach((input) => {
+            input.addEventListener('input', () => {
+                const modelIndex = parseInt(input.dataset.modelIndex);
+                const model = this.modelsInWorkflow[modelIndex];
+                if (model) {
+                    model.url = input.value.trim();
+                }
+                this.updateBatchDownloadButton();
+            });
+        });
+
+        this.updateBatchDownloadButton();
     }
 
     /**

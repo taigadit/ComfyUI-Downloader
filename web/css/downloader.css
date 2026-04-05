@@ -70,10 +70,20 @@
 .downloader-refresh-section {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 16px;
     margin-bottom: 20px;
     padding-bottom: 16px;
     border-bottom: 1px solid #333;
+    flex-wrap: wrap;
+}
+
+.downloader-refresh-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-left: auto;
+    flex-wrap: wrap;
 }
 
 .downloader-refresh-btn {
