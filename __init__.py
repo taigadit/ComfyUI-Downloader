@@ -7,8 +7,10 @@ import os
 import logging
 import asyncio
 import contextlib
+import hashlib
 import shutil
-import urllib.request
+import urllib.parse
+import aiohttp
 import folder_paths
 from aiohttp import web
 from server import PromptServer
@@ -23,6 +25,9 @@ current_download_task = None  # Only one download at a time
 
 # Polling interval for wget-backed progress updates
 PROGRESS_UPDATE_INTERVAL = 0.25
+
+# Suffix for in-progress downloads so ComfyUI never lists a partial file as a model
+PARTIAL_SUFFIX = ".part"
 
 API_PREFIX = "35b631e00fa2dbc173ee4a5f899cba8f"
 
@@ -66,6 +71,14 @@ async def start_download(request):
         if not url or not save_path or not filename:
             return web.json_response(
                 {"error": "Missing required parameters: url, save_path, filename"},
+                status=400
+            )
+
+        # Security: only allow http(s) URLs so the value can never be parsed as a wget option
+        parsed_url = urllib.parse.urlparse(url)
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+            return web.json_response(
+                {"error": "Invalid url: only http:// and https:// URLs are supported"},
                 status=400
             )
 
@@ -123,6 +136,18 @@ async def start_download(request):
                 status=400
             )
 
+        # Use SHA256 hash for unique, URL-safe download_id
+        download_id = hashlib.sha256(f"{save_path}/{safe_filename}".encode()).hexdigest()
+
+        # Don't queue the same target twice while it is still pending
+        existing = active_downloads.get(download_id)
+        if existing and existing.get("status") in ("queued", "downloading"):
+            return web.json_response({
+                "success": True,
+                "download_id": download_id,
+                "message": f"Download already {existing['status']}"
+            })
+
         # Check if file already exists
         if os.path.exists(output_path):
             if not override:
@@ -146,9 +171,7 @@ async def start_download(request):
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        # Mark as queued - use SHA256 hash for unique, URL-safe download_id
-        import hashlib
-        download_id = hashlib.sha256(f"{save_path}/{safe_filename}".encode()).hexdigest()
+        # Mark as queued
         active_downloads[download_id] = {
             "url": url,
             "filename": safe_filename,
@@ -237,18 +260,18 @@ def on_download_complete(download_id):
 
 async def get_remote_file_size(url):
     """Best-effort remote file size lookup for progress percentages."""
-    request = urllib.request.Request(url, method="HEAD")
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return int(response.headers.get("Content-Length", 0))
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.head(url, allow_redirects=True) as response:
+            return int(response.headers.get("Content-Length", 0))
 
 
-async def report_wget_progress(download_id):
-    """Poll the target file size while wget writes to disk."""
+async def report_wget_progress(download_id, temp_path):
+    """Poll the partial file size while wget writes to disk."""
     download_state = active_downloads.get(download_id)
     if download_state is None:
         return
 
-    output_path = download_state["output_path"]
     total_size = download_state.get("total", 0)
 
     while True:
@@ -263,7 +286,7 @@ async def report_wget_progress(download_id):
         if download_id not in active_downloads:
             return
 
-        downloaded_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        downloaded_size = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
         active_downloads[download_id]["downloaded"] = downloaded_size
 
         progress = 0
@@ -282,16 +305,18 @@ async def report_wget_progress(download_id):
 
 
 async def download_file(url, output_path, download_id):
-    """Download file with wget and poll the output file for progress."""
-    wget_path = shutil.which("wget")
-    if wget_path is None:
-        raise RuntimeError("wget not found in PATH")
-
-    logging.info(f"[ComfyUI-Downloader] Download {download_id} using wget")
-
+    """Download file with wget into a .part file, then move it into place on success."""
+    temp_path = output_path + PARTIAL_SUFFIX
     progress_task = None
+    completed = False
 
     try:
+        wget_path = shutil.which("wget")
+        if wget_path is None:
+            raise RuntimeError("wget not found in PATH. Please install wget on the ComfyUI server.")
+
+        logging.info(f"[ComfyUI-Downloader] Download {download_id} using wget")
+
         total_size = 0
         try:
             total_size = await get_remote_file_size(url)
@@ -309,34 +334,36 @@ async def download_file(url, output_path, download_id):
             "process": None,
         }
 
-        # Always start from a clean target file instead of resuming partial content.
-        if os.path.exists(output_path):
-            os.remove(output_path)
+        # Always start from a clean partial file instead of resuming stale content.
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
         process = await asyncio.create_subprocess_exec(
             wget_path,
             "--output-document",
-            output_path,
+            temp_path,
+            "--",
             url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         download_control[download_id]["process"] = process
 
-        progress_task = asyncio.create_task(report_wget_progress(download_id))
+        progress_task = asyncio.create_task(report_wget_progress(download_id, temp_path))
         stdout, stderr = await process.communicate()
 
         if progress_task is not None:
             await progress_task
 
         if download_control.get(download_id, {}).get("cancelled"):
-            if os.path.exists(output_path):
-                os.remove(output_path)
             return
 
         if process.returncode != 0:
             error_output = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
             raise RuntimeError(error_output or f"wget exited with code {process.returncode}")
+
+        os.replace(temp_path, output_path)
+        completed = True
 
         final_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
         if download_id in active_downloads:
@@ -368,6 +395,11 @@ async def download_file(url, output_path, download_id):
             progress_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await progress_task
+
+        # Never leave a partial file behind after an error or cancellation
+        if not completed and os.path.exists(temp_path):
+            with contextlib.suppress(OSError):
+                os.remove(temp_path)
 
         if download_id in download_control:
             del download_control[download_id]

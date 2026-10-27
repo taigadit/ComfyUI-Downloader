@@ -945,10 +945,10 @@ export class DownloaderUI {
                     <span class="downloader-model-index">${index + 1}.</span>
                     <span class="downloader-model-filename">
                         ${this.escapeHtml(model.filename)}
-                        <a href="https://huggingface.co/models?search=${encodeURIComponent(this.escapeHtml(model.filename))}" target="_blank" title="Search on Huggingface" style="cursor: pointer; margin-left: 2px; font-size: 1.2em; text-decoration: none;">🔍</a>
-                        <a href="https://www.google.com/search?q=${encodeURIComponent(this.escapeHtml(model.filename))}" target="_blank" title="Search on Google" style="cursor: pointer; margin-left: 2px; font-size: 1.2em; text-decoration: none;">🔍</a>
+                        <a href="https://huggingface.co/models?search=${encodeURIComponent(model.filename)}" target="_blank" title="Search on Huggingface" style="cursor: pointer; margin-left: 2px; font-size: 1.2em; text-decoration: none;">🔍</a>
+                        <a href="https://www.google.com/search?q=${encodeURIComponent(model.filename)}" target="_blank" title="Search on Google" style="cursor: pointer; margin-left: 2px; font-size: 1.2em; text-decoration: none;">🔍</a>
                     </span>
-                    <span class="downloader-model-extension">${model.extension}</span>
+                    <span class="downloader-model-extension">${this.escapeHtml(model.extension)}</span>
                 </div>
                 <div class="downloader-model-details">
                     <div class="downloader-model-path" title="${this.escapeHtml(model.fullPath)}">

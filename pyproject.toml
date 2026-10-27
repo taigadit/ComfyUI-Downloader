@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-downloader"
+description = "Find the models a ComfyUI workflow needs and download missing ones straight to the server, one click or all at once."
+version = "1.1.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+dependencies = ["aiohttp"]
+keywords = ["comfyui", "model downloader", "missing models", "huggingface", "batch download"]
+
+[project.urls]
+Repository = "https://github.com/taigadit/ComfyUI-Downloader"
+"Bug Tracker" = "https://github.com/taigadit/ComfyUI-Downloader/issues"
+
+[tool.comfy]
+PublisherId = ""  # Fill in your Comfy Registry publisher ID before `comfy node publish`
+DisplayName = "ComfyUI-Downloader"
+Icon = ""

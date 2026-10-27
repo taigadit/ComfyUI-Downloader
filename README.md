@@ -105,6 +105,13 @@ Example of the batch download controls in the top-right action bar, with the **D
 
 The extension shells out to `wget` for the actual file transfer and polls the output file to report progress back to the UI.
 
+- Files are written to `<name>.part` while downloading and only renamed to the final filename once the download succeeds, so ComfyUI never loads a half-downloaded model. Failed or cancelled downloads clean up their `.part` file.
+- Only `http://` and `https://` URLs are accepted.
+
+### Security Note
+
+The download API runs on your ComfyUI server and can write into your model folders. If you start ComfyUI with `--listen`, anyone who can reach the server can trigger downloads. Keep ComfyUI on a trusted network or behind authentication; don't expose it directly to the public internet.
+
 ## Supported Folders
 
 The downloader supports all standard ComfyUI model directories:
